@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Notifications\Notifiable;
 
 #[Fillable(["user_id",'title', 'status'])]
-class Studies extends Model
+class Study extends Model
 {
     use HasFactory;
 
