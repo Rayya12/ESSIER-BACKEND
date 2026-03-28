@@ -2,7 +2,6 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\Api\StudyController;
 
 
 Route::post('/register', [App\Http\Controllers\Api\AuthController::class, 'register']);
@@ -15,10 +14,10 @@ Route::middleware(['auth:sanctum'])->group(function () {
     });
 
     Route::prefix('studies')->group(function () {
-        Route::post('/',           [StudyController::class, 'store']);
-        Route::get('/',            [StudyController::class, 'index']);
-        Route::get('/{id}',        [StudyController::class, 'show']);
-        Route::get('/{id}/status', [StudyController::class, 'status']);
+        Route::post('/',           ['App\Http\Controllers\Api\StudyController', 'store']);
+        Route::get('/',            ['App\Http\Controllers\Api\StudyController', 'index']);
+        Route::get('/{id}',        ['App\Http\Controllers\Api\StudyController', 'show']);
+        Route::get('/{id}/status', ['App\Http\Controllers\Api\StudyController', 'status']);
     });
 });
 
