@@ -35,8 +35,11 @@ return [
         ],
     ],
 
-    "gemini" => [
-        'api_key' => env('GEMINI_API_KEY'),
+    'gemini' => [
+        'api_key'         => env('GEMINI_API_KEY'),
+        'base_url'        => env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
+        'embedding_model' => env('GEMINI_EMBEDDING_MODEL', 'models/text-embedding-004'),
+        'llm_model'       => env('GEMINI_LLM_MODEL', 'models/gemini-1.5-flash'),
     ],
 
 ];

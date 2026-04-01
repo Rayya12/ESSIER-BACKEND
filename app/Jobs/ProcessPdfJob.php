@@ -84,7 +84,7 @@ class ProcessPdfJob implements ShouldQueue
                 if ($i === 0) {
                     // Reuse the existing document record for the first chunk
                     $this->document->update(['extracted_text' => $chunk]);
-                    $this->storeVector('study_documents', $this->document->id, $chunkEmbeddings[$i]);
+                    $this->storeVectorContent('study_documents', $this->document->id, $chunkEmbeddings[$i]);
                 } else {
                     $doc = StudyDocument::create([
                         'study_id'       => $this->study->id,
@@ -93,7 +93,7 @@ class ProcessPdfJob implements ShouldQueue
                         'extracted_text' => $chunk,
                         'created_at'     => now(),
                     ]);
-                    $this->storeVector('study_documents', $doc->id, $chunkEmbeddings[$i]);
+                    $this->storeVectorContent('study_documents', $doc->id, $chunkEmbeddings[$i]);
                 }
             }
 
@@ -161,7 +161,7 @@ class ProcessPdfJob implements ShouldQueue
     }
 
     /**
-     * Store a pgvector embedding via raw SQL (Eloquent doesn't support vector type natively).
+     * Store a pgvector embedding via raw SQL.
      *
      * @param float[] $embedding
      */
@@ -171,6 +171,21 @@ class ProcessPdfJob implements ShouldQueue
 
         DB::statement(
             "UPDATE \"{$table}\" SET ideal_embedding = ?::vector WHERE id = ?",
+            [$vector, $id]
+        );
+    }
+
+    /**
+     * Store a pgvector embedding via raw SQL.
+     *
+     * @param float[] $embedding
+     */
+    private function storeVectorContent(string $table, string $id, array $embedding): void
+    {
+        $vector = '[' . implode(',', $embedding) . ']';
+
+        DB::statement(
+            "UPDATE \"{$table}\" SET content_embedding = ?::vector WHERE id = ?",
             [$vector, $id]
         );
     }

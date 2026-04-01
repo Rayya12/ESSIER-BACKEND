@@ -9,15 +9,17 @@ use Illuminate\Support\Facades\Log;
 class GeminiService
 {
     private string $apiKey;
-    private string $baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
-
-    private string $embeddingModel = 'models/text-embedding-004';
-    private string $llmModel       = 'models/gemini-1.5-flash';
+    private string $baseUrl;
+    private string $embeddingModel;
+    private string $llmModel;
 
     public function __construct()
     {
-        $this->apiKey = config('services.gemini.api_key');
-    }
+        $this->apiKey         = config('services.gemini.api_key');
+        $this->baseUrl        = config('services.gemini.base_url');
+        $this->embeddingModel = config('services.gemini.embedding_model');
+        $this->llmModel       = config('services.gemini.llm_model');
+}
 
     // -------------------------------------------------------------------------
     // VISION — describe / OCR a page image
@@ -117,35 +119,46 @@ PROMPT;
      * @param  string[] $chunks
      * @return float[][] — same order as input
      */
-    public function batchEmbedTexts(array $chunks): array
-    {
-        if (empty($chunks)) {
-            return [];
-        }
+ public function batchEmbedTexts(array $chunks): array
+{
+    if (empty($chunks)) {
+        return [];
+    }
 
-        // Split into batches of 100 (Gemini limit)
-        $batches    = array_chunk($chunks, 100);
-        $allVectors = [];
+    // 1. Ensure the model name has 'models/' prefix for the request body
+    // but we'll strip it for the URL construction to avoid double-prefixing
+    $rawModel = str_replace('models/', '', $this->embeddingModel);
+    $modelPath = "models/{$rawModel}";
 
-        foreach ($batches as $batch) {
-            $requests = array_map(fn($chunk) => [
-                'model'   => $this->embeddingModel,
-                'content' => ['parts' => [['text' => $chunk]]],
-            ], $batch);
+    $batches = array_chunk($chunks, 100);
+    $allVectors = [];
 
-            $response = Http::withQueryParameters(['key' => $this->apiKey])
-                ->post("{$this->baseUrl}/{$this->embeddingModel}:batchEmbedContents", [
-                    'requests' => $requests,
-                ]);
+    foreach ($batches as $batch) {
+        // Gemini Batch API requires the 'model' key in EVERY request object
+        $requests = array_map(fn($chunk) => [
+            'model'   => $modelPath, 
+            'content' => ['parts' => [['text' => $chunk]]],
+        ], $batch);
 
-            $this->assertSuccess($response, 'batchEmbedTexts');
+        $response = Http::withQueryParameters(['key' => $this->apiKey])
+            ->timeout(60)
+            ->post("{$this->baseUrl}/{$modelPath}:batchEmbedContents", [
+                'requests' => $requests,
+            ]);
 
-            $vectors    = array_column($response->json('embeddings'), 'values');
+        $this->assertSuccess($response, 'batchEmbedTexts');
+
+        $embeddings = $response->json('embeddings');
+        
+        // Safety check if 'embeddings' key exists
+        if (isset($embeddings)) {
+            $vectors    = array_column($embeddings, 'values');
             $allVectors = array_merge($allVectors, $vectors);
         }
-
-        return $allVectors;
     }
+
+    return $allVectors;
+}
 
     // -------------------------------------------------------------------------
     // QUIZ GENERATION
