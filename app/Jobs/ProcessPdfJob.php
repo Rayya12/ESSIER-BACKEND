@@ -115,7 +115,7 @@ class ProcessPdfJob implements ShouldQueue
                         'order_index'   => $idx + 1,
                     ]);
 
-                    $this->storeVector('question', $question->id, $answerEmbeddings[$idx]);
+                    $this->storeVector('questions', $question->id, $answerEmbeddings[$idx]);
                 }
 
                 Log::info('ProcessPdfJob: questions generated', [
@@ -190,3 +190,4 @@ class ProcessPdfJob implements ShouldQueue
         );
     }
 }
+

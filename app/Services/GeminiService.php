@@ -186,6 +186,7 @@ PROMPT;
         $result = $this->generateContent($prompt);
         $parsed = $this->parseJson($result);
 
+        Log::info('Parsed Result:', ['parsed' => $parsed]);
         return $parsed['questions'] ?? [];
     }
 
@@ -225,7 +226,7 @@ PROMPT;
                 ],
                 'generationConfig' => [
                     'temperature'     => 0.4,
-                    'maxOutputTokens' => 2048,
+                    'maxOutputTokens' => 8192,
                 ],
             ]);
 
@@ -234,21 +235,29 @@ PROMPT;
         return $response->json('candidates.0.content.parts.0.text') ?? '';
     }
 
-    private function parseJson(string $raw): array
-    {
-        // Strip markdown code fences if Gemini wraps the response
-        $clean = preg_replace('/^```(?:json)?\s*/i', '', trim($raw));
-        $clean = preg_replace('/\s*```$/', '', $clean);
+ 
 
-        $decoded = json_decode($clean, true);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            Log::warning('GeminiService: failed to parse JSON response', ['raw' => $raw]);
-            return [];
-        }
-
-        return $decoded;
+private function parseJson(string $result): array
+{
+    // Ambil konten di dalam fence ```json ... ``` atau ``` ... ```
+    if (preg_match('/```(?:json)?\s*([\s\S]*?)\s*```/', $result, $matches)) {
+        $cleaned = $matches[1];
+    } else {
+        $cleaned = trim($result);
     }
+
+    $decoded = json_decode($cleaned, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        Log::error('parseJson failed', [
+            'error' => json_last_error_msg(),
+            'raw'   => $result,
+        ]);
+        return [];
+    }
+
+    return $decoded ?? [];
+}
 
     private function assertSuccess(Response $response, string $context): void
     {
