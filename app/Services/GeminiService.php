@@ -188,7 +188,7 @@ PROMPT;
         $prompt = <<<PROMPT
 Kamu adalah AI pendidikan. Berdasarkan materi di bawah ini, buat {$count} pertanyaan essay yang menguji pemahaman mendalam beserta jawaban idealnya.
 
-Prioritaskan konten dari bagian [TEKS]. Jika ada bagian [VISUAL], buat minimal 1 pertanyaan yang berkaitan dengan diagram atau gambar yang dideskripsikan.
+Prioritaskan konten dari bagian [TEKS]. Jangan memasukkan bagian [VISUAL] dalam pertanyaan.
 
 FORMAT RESPONS (JSON saja, tanpa penjelasan, tanpa markdown fence):
 {"questions":[{"question_text":"...","ideal_answer":"..."}]}
