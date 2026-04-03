@@ -13,13 +13,24 @@ class GeminiService
     private string $embeddingModel;
     private string $llmModel;
 
+    /**
+     * Max retry attempts saat kena 429 atau 5xx.
+     */
+    private int $maxRetries = 4;
+
+    /**
+     * Base delay (ms) untuk exponential backoff.
+     * Delay = baseDelayMs * 2^attempt  → 1s, 2s, 4s, 8s
+     */
+    private int $baseDelayMs = 1000;
+
     public function __construct()
     {
         $this->apiKey         = config('services.gemini.api_key');
         $this->baseUrl        = config('services.gemini.base_url');
         $this->embeddingModel = config('services.gemini.embedding_model');
         $this->llmModel       = config('services.gemini.llm_model');
-}
+    }
 
     // -------------------------------------------------------------------------
     // VISION — describe / OCR a page image
@@ -28,9 +39,6 @@ class GeminiService
     /**
      * Send a rendered PDF page (as base64 PNG) to Gemini Vision.
      * Returns extracted text + description of any images/diagrams found.
-     *
-     * @param  string $imageBase64   base64-encoded PNG of the page
-     * @param  string $existingText  any text smalot already extracted (can be empty)
      */
     public function describePageImage(string $imageBase64, string $existingText = ''): string
     {
@@ -60,31 +68,33 @@ FORMAT OUTPUT:
 Gunakan Bahasa Indonesia untuk deskripsi visual. Untuk teks OCR, ikuti bahasa asli dokumen.
 PROMPT;
 
-        $response = Http::withQueryParameters(['key' => $this->apiKey])
-            ->timeout(60)
-            ->post("{$this->baseUrl}/{$this->llmModel}:generateContent", [
-                'contents' => [
-                    [
-                        'parts' => [
-                            [
-                                'inline_data' => [
-                                    'mime_type' => 'image/png',
-                                    'data'      => $imageBase64,
+        return $this->retryRequest(function () use ($prompt, $imageBase64) {
+            $response = Http::withQueryParameters(['key' => $this->apiKey])
+                ->timeout(90)
+                ->post("{$this->baseUrl}/{$this->llmModel}:generateContent", [
+                    'contents' => [
+                        [
+                            'parts' => [
+                                [
+                                    'inline_data' => [
+                                        'mime_type' => 'image/png',
+                                        'data'      => $imageBase64,
+                                    ],
                                 ],
+                                ['text' => $prompt],
                             ],
-                            ['text' => $prompt],
                         ],
                     ],
-                ],
-                'generationConfig' => [
-                    'temperature'     => 0.1, // low temp for accurate OCR
-                    'maxOutputTokens' => 4096,
-                ],
-            ]);
+                    'generationConfig' => [
+                        'temperature'     => 0.1,
+                        'maxOutputTokens' => 4096,
+                    ],
+                ]);
 
-        $this->assertSuccess($response, 'describePageImage');
+            $this->assertSuccess($response, 'describePageImage');
 
-        return trim($response->json('candidates.0.content.parts.0.text') ?? '');
+            return trim($response->json('candidates.0.content.parts.0.text') ?? '');
+        }, 'describePageImage');
     }
 
     // -------------------------------------------------------------------------
@@ -93,72 +103,76 @@ PROMPT;
 
     /**
      * Generate an embedding vector for a single text chunk.
-     * Returns float[] with 768 dimensions (text-embedding-004).
      *
      * @return float[]
      */
     public function embedText(string $text): array
     {
-        $response = Http::withQueryParameters(['key' => $this->apiKey])
-            ->post("{$this->baseUrl}/{$this->embeddingModel}:embedContent", [
-                'model'   => $this->embeddingModel,
-                'content' => [
-                    'parts' => [['text' => $text]],
-                ],
-            ]);
+        return $this->retryRequest(function () use ($text) {
+            $response = Http::withQueryParameters(['key' => $this->apiKey])
+                ->timeout(30)
+                ->post("{$this->baseUrl}/{$this->embeddingModel}:embedContent", [
+                    'model'   => $this->embeddingModel,
+                    'content' => [
+                        'parts' => [['text' => $text]],
+                    ],
+                ]);
 
-        $this->assertSuccess($response, 'embedText');
+            $this->assertSuccess($response, 'embedText');
 
-        return $response->json('embedding.values');
+            return $response->json('embedding.values');
+        }, 'embedText');
     }
 
     /**
      * Batch embed multiple text chunks.
      * Gemini supports up to 100 items per batchEmbedContents request.
+     * Dibatasi 5 batch per menit untuk hindari rate limit 429.
      *
      * @param  string[] $chunks
-     * @return float[][] — same order as input
+     * @return float[][]
      */
- public function batchEmbedTexts(array $chunks): array
-{
-    if (empty($chunks)) {
-        return [];
-    }
+    public function batchEmbedTexts(array $chunks): array
+    {
+        if (empty($chunks)) {
+            return [];
+        }
 
-    // 1. Ensure the model name has 'models/' prefix for the request body
-    // but we'll strip it for the URL construction to avoid double-prefixing
-    $rawModel = str_replace('models/', '', $this->embeddingModel);
-    $modelPath = "models/{$rawModel}";
+        $rawModel   = str_replace('models/', '', $this->embeddingModel);
+        $modelPath  = "models/{$rawModel}";
+        $batches    = array_chunk($chunks, 100);
+        $allVectors = [];
 
-    $batches = array_chunk($chunks, 100);
-    $allVectors = [];
+        foreach ($batches as $batchIndex => $batch) {
+            // Delay antar batch untuk hindari 429 (kecuali batch pertama)
+            if ($batchIndex > 0) {
+                $this->sleep(2000); // 2 detik antar batch
+            }
 
-    foreach ($batches as $batch) {
-        // Gemini Batch API requires the 'model' key in EVERY request object
-        $requests = array_map(fn($chunk) => [
-            'model'   => $modelPath, 
-            'content' => ['parts' => [['text' => $chunk]]],
-        ], $batch);
+            $requests = array_map(fn($chunk) => [
+                'model'   => $modelPath,
+                'content' => ['parts' => [['text' => $chunk]]],
+            ], $batch);
 
-        $response = Http::withQueryParameters(['key' => $this->apiKey])
-            ->timeout(60)
-            ->post("{$this->baseUrl}/{$modelPath}:batchEmbedContents", [
-                'requests' => $requests,
-            ]);
+            $vectors = $this->retryRequest(function () use ($modelPath, $requests) {
+                $response = Http::withQueryParameters(['key' => $this->apiKey])
+                    ->timeout(60)
+                    ->post("{$this->baseUrl}/{$modelPath}:batchEmbedContents", [
+                        'requests' => $requests,
+                    ]);
 
-        $this->assertSuccess($response, 'batchEmbedTexts');
+                $this->assertSuccess($response, 'batchEmbedTexts');
 
-        $embeddings = $response->json('embeddings');
-        
-        // Safety check if 'embeddings' key exists
-        if (isset($embeddings)) {
-            $vectors    = array_column($embeddings, 'values');
+                $embeddings = $response->json('embeddings') ?? [];
+
+                return array_column($embeddings, 'values');
+            }, 'batchEmbedTexts');
+
             $allVectors = array_merge($allVectors, $vectors);
         }
-    }
 
-    return $allVectors;
-}
+        return $allVectors;
+    }
 
     // -------------------------------------------------------------------------
     // QUIZ GENERATION
@@ -187,6 +201,7 @@ PROMPT;
         $parsed = $this->parseJson($result);
 
         Log::info('Parsed Result:', ['parsed' => $parsed]);
+
         return $parsed['questions'] ?? [];
     }
 
@@ -213,51 +228,86 @@ PROMPT;
     }
 
     // -------------------------------------------------------------------------
-    // INTERNAL HELPERS
+    // INTERNAL — HTTP helpers
     // -------------------------------------------------------------------------
 
     private function generateContent(string $prompt): string
     {
-        $response = Http::withQueryParameters(['key' => $this->apiKey])
-            ->timeout(60)
-            ->post("{$this->baseUrl}/{$this->llmModel}:generateContent", [
-                'contents' => [
-                    ['parts' => [['text' => $prompt]]],
-                ],
-                'generationConfig' => [
-                    'temperature'     => 0.4,
-                    'maxOutputTokens' => 8192,
-                ],
+        return $this->retryRequest(function () use ($prompt) {
+            $response = Http::withQueryParameters(['key' => $this->apiKey])
+                ->timeout(120)
+                ->post("{$this->baseUrl}/{$this->llmModel}:generateContent", [
+                    'contents' => [
+                        ['parts' => [['text' => $prompt]]],
+                    ],
+                    'generationConfig' => [
+                        'temperature'     => 0.4,
+                        'maxOutputTokens' => 8192,
+                    ],
+                ]);
+
+            $this->assertSuccess($response, 'generateContent');
+
+            return $response->json('candidates.0.content.parts.0.text') ?? '';
+        }, 'generateContent');
+    }
+
+    /**
+     * Retry wrapper dengan exponential backoff.
+     * Retry hanya untuk 429 (rate limit) dan 5xx (server error).
+     */
+    private function retryRequest(callable $callback, string $context): mixed
+    {
+        $attempt = 0;
+
+        while (true) {
+            try {
+                return $callback();
+            } catch (\RuntimeException $e) {
+                $isRateLimit  = str_contains($e->getMessage(), '429');
+                $isServerErr  = preg_match('/HTTP 5\d\d/', $e->getMessage());
+
+                if ((!$isRateLimit && !$isServerErr) || $attempt >= $this->maxRetries) {
+                    throw $e;
+                }
+
+                $delayMs = $this->baseDelayMs * (2 ** $attempt);
+
+                // Tambah jitter ±20% agar tidak semua retry barengan
+                $jitter  = (int) ($delayMs * 0.2);
+                $delayMs = $delayMs + rand(-$jitter, $jitter);
+
+                Log::warning("GeminiService::{$context} retry #{$attempt}", [
+                    'reason'   => $isRateLimit ? '429 rate limit' : '5xx server error',
+                    'delay_ms' => $delayMs,
+                ]);
+
+                $this->sleep($delayMs);
+                $attempt++;
+            }
+        }
+    }
+
+    private function parseJson(string $result): array
+    {
+        if (preg_match('/```(?:json)?\s*([\s\S]*?)\s*```/', $result, $matches)) {
+            $cleaned = $matches[1];
+        } else {
+            $cleaned = trim($result);
+        }
+
+        $decoded = json_decode($cleaned, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            Log::error('parseJson failed', [
+                'error' => json_last_error_msg(),
+                'raw'   => $result,
             ]);
+            return [];
+        }
 
-        $this->assertSuccess($response, 'generateContent');
-
-        return $response->json('candidates.0.content.parts.0.text') ?? '';
+        return $decoded ?? [];
     }
-
- 
-
-private function parseJson(string $result): array
-{
-    // Ambil konten di dalam fence ```json ... ``` atau ``` ... ```
-    if (preg_match('/```(?:json)?\s*([\s\S]*?)\s*```/', $result, $matches)) {
-        $cleaned = $matches[1];
-    } else {
-        $cleaned = trim($result);
-    }
-
-    $decoded = json_decode($cleaned, true);
-
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        Log::error('parseJson failed', [
-            'error' => json_last_error_msg(),
-            'raw'   => $result,
-        ]);
-        return [];
-    }
-
-    return $decoded ?? [];
-}
 
     private function assertSuccess(Response $response, string $context): void
     {
@@ -270,5 +320,13 @@ private function parseJson(string $result): array
                 "Gemini API error in {$context}: HTTP {$response->status()}"
             );
         }
+    }
+
+    /**
+     * Sleep dalam milidetik.
+     */
+    private function sleep(int $ms): void
+    {
+        usleep($ms * 1000);
     }
 }

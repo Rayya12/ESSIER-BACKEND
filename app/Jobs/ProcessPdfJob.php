@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\Mnemonic;
 use App\Models\Question;
 use App\Models\Study;
+use App\Models\StudyChunk;
 use App\Models\StudyDocument;
 use App\Services\GeminiService;
 use App\Services\PdfParserService;
@@ -21,19 +22,13 @@ class ProcessPdfJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /**
-     * Allow 3 attempts — Gemini Vision calls can occasionally time out.
-     */
+    /** Retry 3x — GeminiService sudah handle 429 sendiri via backoff */
     public int $tries = 3;
 
-    /**
-     * Exponential backoff between retries (seconds).
-     */
-    public array $backoff = [30, 90, 180];
+    /** Backoff antar job retry (bukan antar API call) */
+    public array $backoff = [60, 180, 300];
 
-    /**
-     * Generous timeout — Vision processing of a 50-page PDF can take a while.
-     */
+    /** Generous timeout untuk PDF besar */
     public int $timeout = 600;
 
     public function __construct(
@@ -51,7 +46,7 @@ class ProcessPdfJob implements ShouldQueue
             $absolutePath = Storage::disk('private')->path($this->document->file_path);
 
             // ----------------------------------------------------------------
-            // STEP 1: Parse PDF (text + Vision fallback per image/scan page)
+            // STEP 1: Parse PDF
             // ----------------------------------------------------------------
             [
                 'text'         => $fullText,
@@ -70,32 +65,33 @@ class ProcessPdfJob implements ShouldQueue
             Log::info('ProcessPdfJob: PDF parsed', [
                 'study_id'     => $this->study->id,
                 'pages'        => $pageCount,
-                'vision_pages' => $visionPages, // pages that used Gemini Vision
+                'vision_pages' => $visionPages,
                 'chunks'       => count($chunks),
                 'char_count'   => mb_strlen($fullText),
             ]);
 
             // ----------------------------------------------------------------
-            // STEP 2: Store extracted text & embed chunks → study_documents
+            // STEP 2: Embed chunks → simpan ke study_chunks
             // ----------------------------------------------------------------
             $chunkEmbeddings = $gemini->batchEmbedTexts($chunks);
 
-            foreach ($chunks as $i => $chunk) {
-                if ($i === 0) {
-                    // Reuse the existing document record for the first chunk
-                    $this->document->update(['extracted_text' => $chunk]);
-                    $this->storeVectorContent('study_documents', $this->document->id, $chunkEmbeddings[$i]);
-                } else {
-                    $doc = StudyDocument::create([
-                        'study_id'       => $this->study->id,
-                        'file_name'      => $this->document->file_name . " [chunk {$i}]",
-                        'file_path'      => $this->document->file_path,
-                        'extracted_text' => $chunk,
-                        'created_at'     => now(),
-                    ]);
-                    $this->storeVectorContent('study_documents', $doc->id, $chunkEmbeddings[$i]);
+            foreach ($chunks as $i => $chunkText) {
+                $chunk = StudyChunk::create([
+                    'study_document_id' => $this->document->id,
+                    'study_id'          => $this->study->id,
+                    'chunk_index'       => $i,
+                    'content'           => $chunkText,
+                ]);
+
+                if (!empty($chunkEmbeddings[$i])) {
+                    $this->storeChunkEmbedding($chunk->id, $chunkEmbeddings[$i]);
                 }
             }
+
+            Log::info('ProcessPdfJob: chunks stored', [
+                'study_id' => $this->study->id,
+                'count'    => count($chunks),
+            ]);
 
             // ----------------------------------------------------------------
             // STEP 3: Generate quiz questions + embed ideal answers
@@ -108,14 +104,16 @@ class ProcessPdfJob implements ShouldQueue
 
                 foreach ($questions as $idx => $q) {
                     $question = Question::create([
-                        'study_id'      => $this->study->id,
-                        'question_text' => $q['question_text'],
-                        'ideal_answer'  => $q['ideal_answer'],
+                        'study_id'       => $this->study->id,
+                        'question_text'  => $q['question_text'],
+                        'ideal_answer'   => $q['ideal_answer'],
                         'extracted_text' => $fullText,
-                        'order_index'   => $idx + 1,
+                        'order_index'    => $idx + 1,
                     ]);
 
-                    $this->storeVector('questions', $question->id, $answerEmbeddings[$idx]);
+                    if (!empty($answerEmbeddings[$idx])) {
+                        $this->storeQuestionEmbedding($question->id, $answerEmbeddings[$idx]);
+                    }
                 }
 
                 Log::info('ProcessPdfJob: questions generated', [
@@ -130,9 +128,8 @@ class ProcessPdfJob implements ShouldQueue
             $mnemonicsText = $gemini->generateMnemonics($fullText);
 
             Mnemonic::create([
-                'study_id'   => $this->study->id,
-                'content'    => $mnemonicsText,
-                'created_at' => now(),
+                'study_id' => $this->study->id,
+                'content'  => $mnemonicsText,
             ]);
 
             // ----------------------------------------------------------------
@@ -151,7 +148,6 @@ class ProcessPdfJob implements ShouldQueue
                 'error'    => $e->getMessage(),
             ]);
 
-            // On final attempt, surface failure to the user
             if ($this->attempts() >= $this->tries) {
                 $this->study->update(['status' => 'failed']);
             }
@@ -161,33 +157,32 @@ class ProcessPdfJob implements ShouldQueue
     }
 
     /**
-     * Store a pgvector embedding via raw SQL.
+     * Simpan embedding chunk ke study_chunks.
      *
      * @param float[] $embedding
      */
-    private function storeVector(string $table, string $id, array $embedding): void
+    private function storeChunkEmbedding(string $chunkId, array $embedding): void
     {
         $vector = '[' . implode(',', $embedding) . ']';
 
         DB::statement(
-            "UPDATE \"{$table}\" SET ideal_embedding = ?::vector WHERE id = ?",
-            [$vector, $id]
+            'UPDATE "study_chunks" SET content_embedding = ?::vector WHERE id = ?',
+            [$vector, $chunkId]
         );
     }
 
     /**
-     * Store a pgvector embedding via raw SQL.
+     * Simpan embedding jawaban ideal ke questions.
      *
      * @param float[] $embedding
      */
-    private function storeVectorContent(string $table, string $id, array $embedding): void
+    private function storeQuestionEmbedding(string $questionId, array $embedding): void
     {
         $vector = '[' . implode(',', $embedding) . ']';
 
         DB::statement(
-            "UPDATE \"{$table}\" SET content_embedding = ?::vector WHERE id = ?",
-            [$vector, $id]
+            'UPDATE "questions" SET ideal_embedding = ?::vector WHERE id = ?',
+            [$vector, $questionId]
         );
     }
 }
-
